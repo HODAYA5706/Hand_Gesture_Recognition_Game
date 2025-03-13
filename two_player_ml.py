@@ -1,0 +1,531 @@
+import cv2
+import numpy as np
+import time
+import os
+import threading
+import math
+from collections import deque
+import joblib
+from skimage.feature import hog
+import multiprocessing
+import pyautogui
+import keyboard
+
+# keep 10 last hand states
+buffer_size = 5
+hand_state_buffers = {
+    "Player1_Left": deque(["STOP"] * buffer_size, maxlen=buffer_size),
+    "Player1_Right": deque(["STOP"] * buffer_size, maxlen=buffer_size),
+    "Player2_Left": deque(["STOP"] * buffer_size, maxlen=buffer_size),
+    "Player2_Right": deque(["STOP"] * buffer_size, maxlen=buffer_size),
+}
+
+
+import keyboard
+
+class KeyboardController:
+    def __init__(self):
+        self.current_keys = {"Blue": set(), "Red": set()}
+        self.up_pressed = {"Blue": False, "Red": False}  # דגלים לכל שחקן
+        self.drop_pressed = {"Blue": False, "Red": False}  # דגלים ללחיצה על "Drop"
+
+    def press_key(self, key, player):
+        """ לוחץ על מקש אם הוא עדיין לא נלחץ ע"י השחקן הנתון """
+        if key not in self.current_keys[player]:
+            keyboard.press(key)
+            self.current_keys[player].add(key)
+
+    def release_key(self, key, player):
+        """ משחרר מקש אם הוא נלחץ קודם ע"י השחקן הנתון """
+        if key in self.current_keys[player]:
+            keyboard.release(key)
+            self.current_keys[player].remove(key)
+
+    def handle_input(self, input_command, player):
+        """ מטפל בקלט ומפעיל את הלחצנים המתאימים לכל שחקן """
+
+        # הגדרת המקשים של כל שחקן
+        keyboard_map = {
+            "Blue": {"Up": "w", "Left": "a", "Right": "d", "Drop": "s"},
+            "Red": {"Up": "up", "Left": "left", "Right": "right", "Drop": "down"}
+        }
+
+        if player not in keyboard_map:
+            return  # שחקן לא תקף
+
+        keys_to_press = set()
+
+        # טיפול בלחיצת "Up" (קפיצה)
+        if "Up" in input_command and not self.up_pressed[player]:
+            self.press_key(keyboard_map[player]["Up"], player)
+            self.up_pressed[player] = True  # נסמן ש-"Up" נלחץ בפריים הזה
+
+        elif self.up_pressed[player]:
+            self.release_key(keyboard_map[player]["Up"], player)
+            self.up_pressed[player] = False  # נאפס את הדגל כדי לאפשר לחיצה חוזרת
+
+        # טיפול בלחיצת "Drop" (זריקה)
+        if "Drop" in input_command and not self.drop_pressed[player]:
+            self.press_key(keyboard_map[player]["Drop"], player)
+            self.drop_pressed[player] = True  # נסמן ש-"Drop" נלחץ בפריים הזה
+
+        elif self.drop_pressed[player]:
+            self.release_key(keyboard_map[player]["Drop"], player)
+            self.drop_pressed[player] = False  # נאפס את הדגל כדי לאפשר לחיצה חוזרת
+
+        # המשך החזקת Left/Right אם מתקבל
+        if "Left" in input_command:
+            keys_to_press.add(keyboard_map[player]["Left"])
+        if "Right" in input_command:
+            keys_to_press.add(keyboard_map[player]["Right"])
+
+        # לחץ על הכפתורים שנוספו
+        for key in keys_to_press:
+            self.press_key(key, player)
+
+        # שחרר את הכפתורים שלא צריכים להיות לחוצים יותר
+        for key in list(self.current_keys[player]):
+            if key not in keys_to_press and key not in {keyboard_map[player]["Up"], keyboard_map[player]["Drop"]}:
+                self.release_key(key, player)
+
+# יצירת אובייקט לשליטה
+controller = KeyboardController()
+
+
+
+
+def create_roi_overlay(frame, rect_width, capturex,capturey,start=0):
+    overlay = frame.copy()
+
+    # Define hand boxes inside ROI
+    box_width, box_height = int(rect_width * 0.7), int(capturey * 0.4)  # Define box size
+    left_box_x = int(rect_width * 0.2)  # Position left box inside left ROI
+    right_box_x = capturex - rect_width + int(rect_width * 0.2)  # Position right box inside right ROI
+    box_y = int(capturey * 0.35)  # Vertical position for both boxes
+
+    box_color = (255, 0, 0)  # Blue color for the hand boxes
+    thickness = 4  # Thickness of the box border
+
+    # Define bounding boxes for manipulation
+    left_hand_bbox = (left_box_x, box_y, box_width, box_height)
+    right_hand_bbox = (right_box_x, box_y, box_width, box_height)
+
+    # Draw left hand box
+    cv2.rectangle(overlay, (left_box_x, box_y), (left_box_x + box_width, box_y + box_height), box_color, thickness)
+
+    # Draw right hand box
+    cv2.rectangle(overlay, (right_box_x, box_y), (right_box_x + box_width, box_y + box_height), box_color, thickness)
+
+    if start == 1:
+        # Define small box size
+        small_box_width, small_box_height = int(box_width * 0.25), int(box_height * 0.25)
+
+        # Compute position for small boxes (centered horizontally, raised 20% above bottom)
+        left_small_x = left_box_x + (box_width - small_box_width) // 2
+        right_small_x = right_box_x + (box_width - small_box_width) // 2
+        small_y = box_y + int(box_height * 0.85) - small_box_height  # Raise 15% above bottom
+
+        left_small_hand_bbox = (left_small_x, small_y, small_box_width, small_box_height)
+        right_small_hand_bbox = (right_small_x, small_y, small_box_width, small_box_height)
+
+        small_box_color = (0, 255, 0)  # Green color for small boxes
+
+        # Draw left small box
+        cv2.rectangle(overlay, (left_small_x, small_y), (left_small_x + small_box_width, small_y + small_box_height),
+                      small_box_color, 2)
+
+        # Draw right small box
+        cv2.rectangle(overlay, (right_small_x, small_y), (right_small_x + small_box_width, small_y + small_box_height),
+                      small_box_color, 2)
+
+        return overlay, left_hand_bbox, right_hand_bbox, left_small_hand_bbox, right_small_hand_bbox
+
+    return overlay, left_hand_bbox, right_hand_bbox
+
+
+def get_median_color(image, color_space_name):
+    median_values = np.median(image.reshape(-1, 3), axis=0)
+    return median_values
+
+
+def extract_target_colors(color_sample):
+    # Convert ROI to YCrCb
+    roi_ycrcb = cv2.cvtColor(color_sample, cv2.COLOR_BGR2YCrCb)
+
+    # White Balancing
+    wb = cv2.xphoto.createSimpleWB()
+    roi_ycrcb = wb.balanceWhite(roi_ycrcb)
+
+    # Histogram equalization
+    Y, Cr, Cb = cv2.split(roi_ycrcb)
+    Y = cv2.equalizeHist(Y)
+    roi_ycrcb = cv2.merge([Y, Cr, Cb])
+
+    roi_bgr = cv2.cvtColor(roi_ycrcb, cv2.COLOR_YCrCb2BGR)
+    roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    roi_lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2Lab)
+
+    # Get median values
+    tc_bgr = get_median_color(roi_bgr, "BGR")
+    tc_ycrcb = get_median_color(roi_ycrcb, "YCrCb")
+    tc_hsv = get_median_color(roi_hsv, "HSV")
+    tc_lab = get_median_color(roi_lab, "LAB")
+
+    return tc_ycrcb, tc_hsv, tc_lab, tc_bgr
+
+
+def softmax(x):
+    exp_x = np.exp(x - np.max(x))  # Subtract max(x) for numerical stability
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)  # Normalize
+
+
+def color_segmentation(img, t_ycrcb, t_hsv, t_lab, t_bgr, first_time, labels_prev, k=2):
+    """
+    :param img: 3d np array (image in BGR)
+    :param t_ycrcb: 1d np array of ycrcb
+    :param t_hsv:  1d np array of hsv
+    :param t_lab: 1d np array of lab
+    :param t_bgr: 1d np array of bgr
+    :param first_time: bool
+    :param labels_prev: 1d np array of labels
+    :param k: integer
+    :return: segmented image (2d np array) of type uint8
+    """
+    # Resize image
+    img = cv2.resize(img, (100, 100))
+
+    # Init output image
+    output = np.zeros(img.shape[:2], dtype=np.uint8)
+    pre_out = np.zeros(img.shape[:2], dtype=np.uint8)
+
+    # Convert to YCrCb
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+
+    # White Balancing
+    wb = cv2.xphoto.createSimpleWB()
+    img = wb.balanceWhite(img)
+
+    # Histogram equalization
+    Y, Cr, Cb = cv2.split(img)
+    Y = cv2.equalizeHist(Y)
+    img = cv2.merge([Y, Cr, Cb])
+
+    # K-Means
+    reshaped_img = img.reshape((-1, 3))
+    reshaped_img = np.float32(reshaped_img)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 500, 0.01)
+    if first_time == 0:
+        _, labels, ycrcb_centers = cv2.kmeans(reshaped_img.astype(np.float32), k,
+                                None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    else:
+        _, labels, ycrcb_centers = cv2.kmeans(reshaped_img.astype(np.float32), k,
+                                         labels_prev, criteria, 4, cv2.KMEANS_USE_INITIAL_LABELS)
+
+    # Convert to more color spaces
+    img_like_centers = ycrcb_centers.reshape((k, 1, 3))
+    bgr_centers = cv2.cvtColor(img_like_centers, cv2.COLOR_YCrCb2BGR)
+    hsv_centers = cv2.cvtColor(bgr_centers, cv2.COLOR_BGR2HSV).reshape((k, 3))
+    lab_centers = cv2.cvtColor(bgr_centers, cv2.COLOR_BGR2Lab).reshape((k, 3))
+    bgr_centers = bgr_centers.reshape((k, 3))
+
+    # Calculate distances
+    dist_ycrcb = np.linalg.norm(ycrcb_centers - t_ycrcb, axis=1)
+    dist_hsv = np.linalg.norm(hsv_centers - t_hsv, axis=1)
+    dist_lab = np.linalg.norm(lab_centers - t_lab, axis=1)
+    dist_bgr = np.linalg.norm(bgr_centers - t_bgr, axis=1)
+
+    # Calculate SoftMax
+    dist_ycrcb = softmax(dist_ycrcb)
+    dist_hsv = softmax(dist_hsv)
+    dist_lab = softmax(dist_lab)
+    dist_bgr = softmax(dist_bgr)
+
+    # Label of hand cluster
+    hand_cluster = np.argmin(dist_ycrcb + dist_hsv + dist_lab + dist_bgr)
+
+    # Fill pre-output
+    hand_mask = (labels == hand_cluster).reshape(output.shape)
+    pre_out[hand_mask] = 255
+
+    # Find contour
+    all_contours, _ = cv2.findContours(pre_out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(all_contours) > 0:
+        hand_contour = max(all_contours, key=lambda x: cv2.contourArea(x), default=0)
+        # cv2.drawContours(output, hand_contour, -1, (255), thickness=cv2.FILLED)
+        cv2.fillPoly(output, [hand_contour], 255)
+        return output, labels
+
+    return pre_out, labels
+
+# --------------------------------------------------------------------------------------------------
+def main(camera_index, player_name):
+    screen_width, screen_height = pyautogui.size()  # מקבל את גודל המסך
+    mode = 0
+    frame_kmeans_counter = 0  # COUNTER TO DO KMEAN EVERY 3 FRAMES
+    frame_counter = 0  # Counter to generate unique filenames
+    first_time_L = 0
+    first_time_R = 0
+    labels_prev_L = None
+    labels_prev_R = None
+    left_hand_folder_path = r"C:\Users\hoday\Tammy\seg_l"
+    right_hand_folder_path = r"C:\Users\hoday\Tammy\seg_r"''
+    model_l = joblib.load(r"C:\Users\hoday\Tammy\wight\svm_hands_L.pkl")
+    model_r = joblib.load(r"C:\Users\hoday\עבודה ולימודים\תמי\NIZAN\svm_hands_right_nwe.pkl")
+    hog_params = {
+        'pixels_per_cell': (8, 8),
+        'cells_per_block': (2, 2),
+        'orientations': 9,
+        'block_norm': 'L2-Hys',
+        'transform_sqrt': True
+    }
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print("Could not open camera")
+        return
+    
+    capturex = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    capturey = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    rect_width = int(capturex * 0.4)
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+
+
+        ####### mode 0 - INITIALIZE #######################################################################
+        if mode == 0:
+            overlay, left_hand_bbox, right_hand_bbox = create_roi_overlay(frame, rect_width,capturex,capturey)
+            cv2.imshow(f"capture frame - {player_name}", overlay)
+
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == 13:  # Enter => ספירה לאחור
+                countdown_time = 7  # מספר השניות שמחכים
+                start_time = time.time()
+
+                # Countdown
+                while True:
+                    elapsed = time.time() - start_time
+                    remaining = countdown_time - int(elapsed)
+                    if remaining <= 0:
+                        break
+                    ret2, temp_frame = cap.read()
+                    if not ret2:
+                        break
+                    temp_frame = cv2.flip(temp_frame, 1)
+                    temp_overlay, left_hand_bbox, right_hand_bbox, left_small_hand_bbox, right_small_hand_bbox = create_roi_overlay(
+                        temp_frame, rect_width,capturex,capturey, start=1)
+                    cv2.putText(temp_overlay, f"Capture in {remaining}s", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
+                    cv2.imshow(f"capture frame - {player_name}", temp_overlay)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        cv2.destroyWindow(f"capture frame - {player_name}")
+                        return
+
+                # Sample target color and save first mask for left and right
+                _, left_small_bbox, right_small_bbox = create_roi_overlay(frame, rect_width,capturex,capturey)
+                if left_small_bbox and right_small_bbox:
+                    # Left hand ###########################################################################
+                    # Bounding boxes
+                    x1_L, y1_L, w1_L, h1_L = left_small_bbox
+                    sx_L, sy_L, sw_L, sh_L = left_small_hand_bbox
+
+                    # Extract ROIs
+                    roi_l0 = frame[y1_L:y1_L+h1_L, x1_L:x1_L+w1_L]
+                    sample_roi_l = frame[sy_L:sy_L + sh_L,
+                                          sx_L:sx_L + sw_L]
+
+                    # Target colors
+                    tc_ycrcb_l, tc_hsv_l, tc_lab_l, tc_bgr_l = extract_target_colors(sample_roi_l)
+
+                    # Segment roi
+                    segmented_roi_l, _ = color_segmentation(roi_l0, tc_ycrcb_l, tc_hsv_l, tc_lab_l, tc_bgr_l, 0, None)
+
+                    # Save mask
+                    save_path_L = os.path.join(left_hand_folder_path, f'HODAYA_2_hand_seg_L_0.jpg')
+                    cv2.imwrite(save_path_L, segmented_roi_l)
+
+                    # right hand ###########################################################################
+                    # Bounding boxes
+                    x1_R, y1_R, w1_R, h1_R = right_small_bbox
+                    sx_R, sy_R, sw_R, sh_R = right_small_hand_bbox
+
+                    # Extract ROIs
+                    roi_r0 = frame[y1_R:y1_R + h1_R, x1_R:x1_R + w1_R]
+                    sample_roi_r = frame[sy_R:sy_R + sh_R,
+                                  sx_R:sx_R + sw_R]
+
+                    # Target colors
+                    tc_ycrcb_r, tc_hsv_r, tc_lab_r, tc_bgr_r = extract_target_colors(sample_roi_r)
+
+                    # Segment roi
+                    segmented_roi_r, _ = color_segmentation(roi_r0, tc_ycrcb_r, tc_hsv_r, tc_lab_r, tc_bgr_r, 0, None)
+
+                    # Save mask
+                    save_path_R = os.path.join(right_hand_folder_path, f'HODAYA_2_hand_seg_R_0.jpg')
+                    cv2.imwrite(save_path_R, segmented_roi_r)
+                    cv2.destroyWindow(f"capture frame - {player_name}")
+
+                    mode = 1
+                    continue
+
+        ###### mode 1 ####################################################################################
+
+        else:
+            frame_kmeans_counter += 1  # Increment the frame counter for KMeans
+            _, left_small_bbox, right_small_bbox = create_roi_overlay(frame, rect_width,capturex,capturey)
+
+            # Left Hand
+            if left_small_bbox:
+                # Extract left ROI
+                x_L, y_L, w_L, h_L = map(int, left_small_bbox)
+                cv2.rectangle(frame, (x_L - 5, y_L - 5), (x_L + w_L + 5, y_L + h_L + 5), (255, 0, 0), 2)
+                roi_L = frame[y_L:y_L + h_L, x_L:x_L + w_L]  # BGR
+
+                # K-Means
+                if first_time_L == 0:
+                    binary_L, labels_prev_L = color_segmentation(roi_L, tc_ycrcb_l, tc_hsv_l, tc_lab_l, tc_bgr_l,
+                                                              first_time_L, labels_prev_L)
+                    first_time_L = 1
+                else:
+                    binary_L, labels_prev_L = color_segmentation(roi_L, tc_ycrcb_l, tc_hsv_l, tc_lab_l, tc_bgr_l,
+                                                              first_time_L, labels_prev_L)
+
+                # HOG over the binary mask
+                features_l = hog(binary_L, **hog_params)
+
+                # Prediction with model
+                prediction_l = model_l.predict([features_l])
+
+                if player_name == "player1":
+                    label = "Player1_Left"
+                else:
+                    label = "Player2_Left"
+
+                # Result
+                if prediction_l[0] == 0:
+                    hand_state_buffers[label].append("WALK")
+                elif prediction_l[0] == 1:
+                    hand_state_buffers[label].append("STOP")
+                elif prediction_l[0] == 2:
+                    hand_state_buffers[label].append("JUMP")
+                else:
+                    pass
+
+
+                most_common_state_L = max(set(hand_state_buffers[label]), key=hand_state_buffers[label].count)
+
+                # Display result on screen
+                #cv2.putText(frame, most_common_state_L, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255),
+                 #           2)
+
+                save_path_L = os.path.join(left_hand_folder_path, f'HODAYA_2_hand_seg_L_{frame_counter}.jpg')
+                cv2.imwrite(save_path_L, binary_L)
+
+            if right_small_bbox:
+                # Extract left ROI
+                x_R, y_R, w_R, h_R = map(int, right_small_bbox)
+                cv2.rectangle(frame, (x_R - 5, y_R - 5), (x_R + w_R + 5, y_R + h_R + 5), (255, 0, 0), 2)
+                roi_R = frame[y_R:y_R + h_R, x_R:x_R + w_R] # BGR
+
+                # K-Means
+                if first_time_R == 0:
+                    binary_R, labels_prev_R = color_segmentation(roi_R, tc_ycrcb_r, tc_hsv_r, tc_lab_r, tc_bgr_r,
+                                                              first_time_R, labels_prev_R)
+                    first_time_R = 1
+                else:
+                    binary_R, labels_prev_R = color_segmentation(roi_R, tc_ycrcb_r, tc_hsv_r, tc_lab_r, tc_bgr_r,
+                                                              first_time_R, labels_prev_R)
+
+                # HOG over the binary mask
+                features_r = hog(binary_R, **hog_params)
+
+                # Prediction with model
+                prediction_r = model_r.predict([features_r])
+
+                if player_name == "player1":
+                    label = "Player1_Right"
+                else:
+                    label = "Player2_Right"
+
+                # Result
+                if prediction_r[0] == 0:
+                    hand_state_buffers[label].append("WALK")
+                elif prediction_r[0] == 1:
+                    hand_state_buffers[label].append("STOP")
+                elif prediction_r[0] == 2:
+                    hand_state_buffers[label].append("JUMP")
+                else:
+                    pass
+
+                most_common_state_R = max(set(hand_state_buffers[label]), key=hand_state_buffers[label].count)
+
+                # Display result on screen
+                #cv2.putText(frame, most_common_state_R, (capturex - 200, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255),
+                #            2)
+
+                save_path_R = os.path.join(right_hand_folder_path, f'HODAYA_2_hand_seg_R_{frame_counter}.jpg')
+                cv2.imwrite(save_path_R, binary_R)
+
+                # שליטה על המשחק לפי הזיהוי
+                if most_common_state_R == "JUMP" and most_common_state_L == "STOP":
+                    input = "Up-Right"
+                elif most_common_state_R == "WALK" and most_common_state_L == "STOP":
+                    input = "Right"
+                elif most_common_state_R == "STOP" and most_common_state_L == "JUMP":
+                    input = "Up-Left"
+                elif most_common_state_R == "STOP" and most_common_state_L == "WALK":
+                    input = "Left"
+                elif most_common_state_R == "WALK" and most_common_state_L == "WALK":
+                    input = "Drop"
+                else:
+                    input = "Stop"
+
+                cv2.putText(frame, input, (capturex//3, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255),
+                            4)
+
+
+
+                frame_counter += 1
+            scaled_frame = cv2.resize(frame, (int(capturex * 1.5), int(capturey * 1.5)))  # הגדלה פי 1.5
+            cv2.imshow(f"FRAME - {player_name}", scaled_frame)
+
+
+
+
+            if player_name == "Player1":
+                controller.handle_input(input, "Blue")
+            else:
+                controller.handle_input(input, "Red")
+
+
+
+            # הגדרת מיקום יחסי
+            if player_name == "Player1":
+                cv2.moveWindow(f"FRAME - {player_name}", 0, 0)  # שמאל למעלה
+            elif player_name == "Player2":
+                cv2.moveWindow(f"FRAME - {player_name}", 0, screen_height // 2)  # שמאל למטה, חצי גובה המסך
+
+            if cv2.waitKey(1) & 0xFF == ord(' '):
+                break
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    key = cv2.waitKey(1) & 0xFF
+    t1 = multiprocessing.Process(target=main, args=(0, "Player1"))
+    t2 = multiprocessing.Process(target=main, args=(1, "Player2"))
+
+    t1.start()
+    t2.start()
+
+    t1.join()
+    t2.join()
+
